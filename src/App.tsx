@@ -100,27 +100,170 @@ function normalizedPercentages(priorities:{cost:number;shelf:number;eco:number})
   return {cost,shelf,eco:100-cost-shelf}
 }
 
-function scoreMaterial(c: Commodity, m: Material, priorities:{cost:number,shelf:number,eco:number}, temp:number, rh:number) {
-  const tempFit = temp >= c.temp[0] && temp <= c.temp[1] ? 1 : Math.max(0, 1 - Math.abs(temp - (c.temp[0]+c.temp[1])/2)/15)
-  const rhFit = rh >= c.rh[0] && rh <= c.rh[1] ? 1 : Math.max(0, 1 - Math.abs(rh-(c.rh[0]+c.rh[1])/2)/60)
-  const produce = c.respiration > 10
-  const barrier = produce
-    ? (m.otr >= 20 && m.otr <= 500 ? .96 : .55)
-    : Math.max(.35, Math.min(1, (120/(m.otr+8))*.55 + (35/(m.wvtr+3))*.45))
-  const protection = Math.min(100, 45 + barrier*38 + tempFit*10 + rhFit*7)
-  const cost = Math.max(10, Math.min(100, 100 - ((m.cost-150)/280)*80))
-  const eco = Math.min(100, m.bio*.55 + m.recycle*.35 + (m.compostable ? 18 : 0))
-  const shelf = Math.min(100, Math.max(12, c.shelf * (0.55 + barrier*.65) * (tempFit*.65 + .35) / Math.max(1,c.shelf/25)))
-  const normalized = normalizePriorities(priorities)
-  // 35% technical protection + 65% business priorities. The user-facing priority
-  // scores are independent importance levels and are normalized only for scoring.
-  const total = Math.round(
-    protection*0.35 +
-    cost*normalized.cost*0.65 +
-    shelf*normalized.shelf*0.65 +
-    eco*normalized.eco*0.65
+type RequirementProfile = {
+  otr:[number,number]
+  wvtr:[number,number]
+  weights:{
+    otr:number
+    wvtr:number
+    environment:number
+    strength:number
+    active:number
+    shelf:number
+    sustainability:number
+  }
+  breathable:boolean
+  rationale:string
+}
+
+// Product-specific requirement profiles keep the recommendation engine explainable.
+// These are model assumptions for demo decision support, not laboratory specifications.
+const productProfiles: Record<string, RequirementProfile> = {
+  mango:{
+    otr:[120,420], wvtr:[12,45],
+    weights:{otr:.22,wvtr:.20,environment:.12,strength:.06,active:.10,shelf:.16,sustainability:.14},
+    breathable:true,
+    rationale:'Fresh-produce profile prioritizes controlled gas exchange and moisture management.'
+  },
+  paneer:{
+    otr:[0,20], wvtr:[2,14],
+    weights:{otr:.10,wvtr:.22,environment:.18,strength:.12,active:.14,shelf:.18,sustainability:.06},
+    breathable:false,
+    rationale:'Dairy profile prioritizes cold-chain stability, moisture protection and product protection.'
+  },
+  spices:{
+    otr:[0,20], wvtr:[0,6],
+    weights:{otr:.24,wvtr:.30,environment:.06,strength:.08,active:.02,shelf:.20,sustainability:.10},
+    breathable:false,
+    rationale:'Dry-food profile prioritizes very low moisture transmission and oxidation protection.'
+  },
+  strawberry:{
+    otr:[220,500], wvtr:[15,50],
+    weights:{otr:.25,wvtr:.22,environment:.15,strength:.07,active:.10,shelf:.09,sustainability:.12},
+    breathable:true,
+    rationale:'High-respiration produce profile prioritizes gas exchange, humidity control and gentle protection.'
+  },
+  coffee:{
+    otr:[0,8], wvtr:[0,5],
+    weights:{otr:.38,wvtr:.24,environment:.06,strength:.08,active:.02,shelf:.14,sustainability:.08},
+    breathable:false,
+    rationale:'Roasted-coffee profile strongly prioritizes oxygen and moisture barrier performance.'
+  },
+  fish:{
+    otr:[0,20], wvtr:[0,12],
+    weights:{otr:.12,wvtr:.20,environment:.20,strength:.18,active:.08,shelf:.17,sustainability:.05},
+    breathable:false,
+    rationale:'Fresh-protein profile prioritizes cold-chain conditions, moisture protection and mechanical strength.'
+  }
+}
+
+const clamp01=(value:number)=>Math.max(0,Math.min(1,value))
+
+function rangeFit(value:number, range:[number,number]){
+  const [low,high]=range
+  if(value>=low && value<=high) return 1
+  const distance=value<low ? low-value : value-high
+  const span=Math.max(1,high-low)
+  return clamp01(1-distance/(span*1.5))
+}
+
+function lowValueFit(value:number, target:number){
+  return clamp01(1-Math.log1p(value)/Math.log1p(target*12))
+}
+
+function scoreMaterial(
+  c: Commodity,
+  m: Material,
+  priorities:{cost:number,shelf:number,eco:number},
+  temp:number,
+  rh:number,
+  transit:number,
+  coldChain:boolean
+) {
+  const profile=productProfiles[c.id] || productProfiles.mango
+
+  const tempFit = c.temp[0] <= temp && temp <= c.temp[1]
+    ? 1
+    : clamp01(1-Math.abs(temp-(c.temp[0]+c.temp[1])/2)/12)
+
+  const rhFit = c.rh[0] <= rh && rh <= c.rh[1]
+    ? 1
+    : clamp01(1-Math.abs(rh-(c.rh[0]+c.rh[1])/2)/50)
+
+  const environmentFit=(tempFit*.6+rhFit*.4)
+
+  // Produce needs a useful gas-exchange window; dry/sensitive foods benefit
+  // from progressively lower OTR.
+  const otrFit=profile.breathable
+    ? rangeFit(m.otr,profile.otr)
+    : rangeFit(m.otr,profile.otr)
+
+  const wvtrFit=rangeFit(m.wvtr,profile.wvtr)
+  const strengthFit=clamp01(m.strength/95)
+
+  // Active films get a meaningful advantage for short-life/high-moisture foods,
+  // without making "active" a universal winner.
+  const activeFit=m.type.includes('Active Functional')
+    ? (c.aw>.85 ? .98 : .55)
+    : (c.aw>.85 ? .48 : .35)
+
+  const eco=clamp01((m.bio*.50 + m.recycle*.30 + (m.compostable ? 20 : 0))/100)
+  const cost=clamp01(1-((m.cost-150)/250))
+
+  // Transit and cold-chain conditions affect the shelf-life component rather
+  // than acting as a hard material filter.
+  const transitStress=clamp01(transit/60)
+  const coldFit=coldChain
+    ? (c.temp[1] <= 8 ? 1 : .75)
+    : (c.temp[0] >= 8 ? 1 : .80)
+
+  const barrierFit=(otrFit*.55 + wvtrFit*.45)
+  const protection=clamp01(
+    barrierFit*.48 +
+    strengthFit*.18 +
+    environmentFit*.18 +
+    coldFit*.10 +
+    activeFit*.06
   )
-  return {total:Math.min(99,Math.max(35,total)),protection:Math.round(protection),cost:Math.round(cost),eco:Math.round(eco),shelf:Math.round(shelf),tempFit,rhFit}
+
+  const shelf=clamp01(
+    barrierFit*.40 +
+    environmentFit*.22 +
+    strengthFit*.12 +
+    coldFit*.10 +
+    (1-transitStress)*.10 +
+    activeFit*.06
+  )
+
+  const normalized=normalizePriorities(priorities)
+
+  // Technical suitability dominates the business overlay so that a strong
+  // sustainability score cannot overwhelm a poor product-material fit.
+  const technical =
+    otrFit*profile.weights.otr +
+    wvtrFit*profile.weights.wvtr +
+    environmentFit*profile.weights.environment +
+    strengthFit*profile.weights.strength +
+    activeFit*profile.weights.active +
+    shelf*profile.weights.shelf +
+    eco*profile.weights.sustainability
+
+  const business =
+    cost*normalized.cost +
+    shelf*normalized.shelf +
+    eco*normalized.eco
+
+  const total=Math.round((technical*.76 + business*.24)*100)
+
+  return {
+    total:Math.min(99,Math.max(35,total)),
+    protection:Math.round(protection*100),
+    cost:Math.round(cost*100),
+    eco:Math.round(eco*100),
+    shelf:Math.round(shelf*100),
+    tempFit,
+    rhFit
+  }
 }
 
 function App(){
@@ -156,7 +299,7 @@ function App(){
   const commodity = commodities.find(x=>x.id===commodityId)!
   const normalizedWeights = useMemo(()=>normalizePriorities(weights),[weights])
   const normalizedPercent = useMemo(()=>normalizedPercentages(weights),[weights])
-  const ranked = useMemo(()=>materials.map(m=>({m,s:scoreMaterial(commodity,m,weights,temp,rh)})).sort((a,b)=>b.s.total-a.s.total),[commodity,temp,rh,weights])
+  const ranked = useMemo(()=>materials.map(m=>({m,s:scoreMaterial(commodity,m,weights,temp,rh,transit,coldChain)})).sort((a,b)=>b.s.total-a.s.total),[commodity,temp,rh,weights])
   const top = ranked[0]
   const simData = useMemo(()=>Array.from({length:30},(_,i)=>{
     const stress = Math.max(0,(temp-commodity.temp[1])*0.9) + Math.max(0,(rh-commodity.rh[1])*.08) + transit*.015
